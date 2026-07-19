@@ -9,7 +9,92 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/netbirdio/netbird/client/internal/scion"
 )
+
+func TestSCIONTransportUpdatesAuthoritativePeerState(t *testing.T) {
+	status := NewRecorder("https://mgm")
+	if err := status.AddPeer("peer", "peer.example", "100.64.0.2", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := status.UpdatePeerSCIONTransport("peer", true, StatusConnected, false); err != nil {
+		t.Fatal(err)
+	}
+	peerState, err := status.GetPeer("peer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if peerState.ConnStatus != StatusConnected || !peerState.ScionActive || peerState.Relayed {
+		t.Fatalf("unexpected SCION active state: %+v", peerState)
+	}
+	if err := status.UpdatePeerSCIONTransport("peer", false, StatusConnecting, true); err != nil {
+		t.Fatal(err)
+	}
+	peerState, _ = status.GetPeer("peer")
+	if peerState.ConnStatus != StatusConnecting || peerState.ScionActive || !peerState.Relayed {
+		t.Fatalf("unexpected fallback state: %+v", peerState)
+	}
+}
+
+func TestStandbyICEKeepsSCIONAuthoritativeRelayedStatusAndRouterState(t *testing.T) {
+	const key = "peer"
+	status := NewRecorder("https://mgm")
+	if err := status.AddPeer(key, "peer.example", "100.64.0.2", ""); err != nil {
+		t.Fatal(err)
+	}
+	sub := status.SubscribeToPeerStateChanges(context.Background(), key)
+
+	if err := status.UpdatePeerSCIONTransport(key, true, StatusConnected, false); err != nil {
+		t.Fatal(err)
+	}
+	if routerState := (<-sub.Events())[key]; routerState.Relayed {
+		t.Fatal("active SCION was reported as relayed to router consumer")
+	}
+
+	standby := State{
+		PubKey:                     key,
+		ConnStatus:                 StatusConnected,
+		ConnStatusUpdate:           time.Now(),
+		Relayed:                    true,
+		LocalIceCandidateType:      "relay",
+		RemoteIceCandidateType:     "relay",
+		LocalIceCandidateEndpoint:  "192.0.2.1:3478",
+		RemoteIceCandidateEndpoint: "192.0.2.2:3478",
+	}
+	if err := status.UpdatePeerICEState(standby); err != nil {
+		t.Fatal(err)
+	}
+	peerState, err := status.GetPeer(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if peerState.Relayed || !peerState.ScionActive {
+		t.Fatalf("standby TURN replaced authoritative SCION state: %+v", peerState)
+	}
+	if peerState.LocalIceCandidateType != standby.LocalIceCandidateType || peerState.RemoteIceCandidateEndpoint != standby.RemoteIceCandidateEndpoint {
+		t.Fatalf("standby ICE candidate details were not recorded: %+v", peerState)
+	}
+	select {
+	case routerStates := <-sub.Events():
+		t.Fatalf("standby ICE incorrectly changed downstream router state: %+v", routerStates[key])
+	default:
+	}
+
+	if err := status.UpdatePeerSCIONTransport(key, false, StatusConnected, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := status.UpdatePeerICEState(standby); err != nil {
+		t.Fatal(err)
+	}
+	peerState, _ = status.GetPeer(key)
+	if !peerState.Relayed || peerState.ScionActive {
+		t.Fatalf("active TURN did not publish its relayed state: %+v", peerState)
+	}
+	if routerState := (<-sub.Events())[key]; !routerState.Relayed {
+		t.Fatal("active TURN was not reported as relayed to router consumer")
+	}
+}
 
 func TestAddPeer(t *testing.T) {
 	key := "abc"
@@ -278,6 +363,51 @@ func TestUpdateManagementState(t *testing.T) {
 			assert.Equal(t, test.err, status.managementError)
 		})
 	}
+}
+
+func TestFullStatusToProtoIncludesSCION(t *testing.T) {
+	full := FullStatus{
+		ScionState: scion.State{Supported: true, Enabled: true, Active: true, LocalIA: "1-ff00:0:110", LocalAddress: "1-ff00:0:110,[192.0.2.1]:30041", ConnectedPeers: 1, RefreshHealth: "healthy"},
+		Peers:      []State{{Mux: &sync.RWMutex{}, PubKey: "peer", ScionActive: true, ScionPath: "abcd", ScionLatency: 4 * time.Millisecond, ScionPathCount: 2}},
+	}
+	got := full.ToProto()
+	require.True(t, got.GetScionState().GetActive())
+	require.Equal(t, "healthy", got.GetScionState().GetRefreshHealth())
+	require.True(t, got.GetPeers()[0].GetScionActive())
+	require.Equal(t, "abcd", got.GetPeers()[0].GetScionPath())
+	require.Equal(t, 4*time.Millisecond, got.GetPeers()[0].GetScionLatency().AsDuration())
+	require.EqualValues(t, 2, got.GetPeers()[0].GetScionPathCount())
+}
+
+func TestGetFullStatusConcurrentSCIONState(t *testing.T) {
+	status := NewRecorder("https://mgm")
+	states := [2]scion.State{
+		{Supported: true, Enabled: true, Active: true, LocalIA: "1-ff00:0:110", LocalAddress: "1-ff00:0:110,[192.0.2.1]:30041"},
+		{Supported: true, Enabled: true, Active: false, LocalIA: "1-ff00:0:111", LocalAddress: "1-ff00:0:111,[192.0.2.2]:30042"},
+	}
+	status.UpdateSCIONState(states[0])
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := range 1000 {
+			status.UpdateSCIONState(states[i%len(states)])
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		for range 1000 {
+			_ = status.GetFullStatus().ScionState
+		}
+	}()
+	close(start)
+	wg.Wait()
+
+	assert.Equal(t, states[1], status.GetFullStatus().ScionState)
 }
 
 func TestGetFullStatus(t *testing.T) {

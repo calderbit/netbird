@@ -19,6 +19,7 @@ import (
 const (
 	PeerCapabilitySourcePrefixes int32 = 1
 	PeerCapabilityIPv6Overlay    int32 = 2
+	PeerCapabilityScion          int32 = 3
 )
 
 // Peer represents a machine connected to the network.
@@ -172,10 +173,12 @@ type PeerSystemMeta struct { //nolint:revive
 	Flags              Flags       `gorm:"serializer:json"`
 	Files              []File      `gorm:"serializer:json"`
 	Capabilities       []int32     `gorm:"serializer:json"`
+	ScionAddress       string
 }
 
 func (p PeerSystemMeta) isEqual(other PeerSystemMeta) bool {
-	return len(metaDiff(p, other)) == 0
+	diff := diffMeta(p, other, Location{}, Location{})
+	return !diff.Updated()
 }
 
 func (p PeerSystemMeta) isEmpty() bool {
@@ -195,7 +198,8 @@ func (p PeerSystemMeta) isEmpty() bool {
 		p.SystemManufacturer == "" &&
 		p.Environment.Cloud == "" &&
 		p.Environment.Platform == "" &&
-		len(p.Files) == 0
+		len(p.Files) == 0 &&
+		p.ScionAddress == ""
 }
 
 // AddedWithSSOLogin indicates whether this peer has been added with an SSO login by a user.
@@ -213,7 +217,11 @@ func (p *Peer) SupportsIPv6() bool {
 	return !p.Meta.Flags.DisableIPv6 && p.HasCapability(PeerCapabilityIPv6Overlay)
 }
 
-// SupportsSourcePrefixes reports whether the peer reads SourcePrefixes.
+// SupportsSCION reports whether the peer supports SCION addresses.
+func (p *Peer) SupportsSCION() bool {
+	return p.HasCapability(PeerCapabilityScion)
+}
+
 func (p *Peer) SupportsSourcePrefixes() bool {
 	return p.HasCapability(PeerCapabilitySourcePrefixes)
 }
@@ -326,6 +334,10 @@ func (d *MetaDiff) VersionChanged() bool {
 }
 
 // HostnameChanged reports whether the peer's hostname changed.
+func (d *MetaDiff) ScionChanged() bool {
+	return d.OldMeta.ScionAddress != d.NewMeta.ScionAddress
+}
+
 func (d *MetaDiff) HostnameChanged() bool {
 	return d.OldMeta.Hostname != d.NewMeta.Hostname
 }
@@ -378,6 +390,9 @@ func diffMeta(oldMeta, newMeta PeerSystemMeta, oldLocation, newLocation Location
 	}
 	if oldMeta.UIVersion != newMeta.UIVersion {
 		add("ui_version", oldMeta.UIVersion, newMeta.UIVersion)
+	}
+	if oldMeta.ScionAddress != newMeta.ScionAddress {
+		add("scion_address", oldMeta.ScionAddress, newMeta.ScionAddress)
 	}
 	if oldMeta.SystemSerialNumber != newMeta.SystemSerialNumber {
 		add("system_serial_number", oldMeta.SystemSerialNumber, newMeta.SystemSerialNumber)

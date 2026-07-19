@@ -9,6 +9,9 @@ const (
 
 	// ConnectionTypeRelay represents a relayed connection
 	ConnectionTypeRelay ConnectionType = "relay"
+
+	// ConnectionTypeSCION represents a path-aware SCION connection.
+	ConnectionTypeSCION ConnectionType = "scion"
 )
 
 // String returns the string representation of the connection type

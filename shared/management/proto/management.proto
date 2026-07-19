@@ -229,6 +229,8 @@ enum PeerCapability {
   PeerCapabilitySourcePrefixes = 1;
   // Client handles IPv6 overlay addresses and firewall rules.
   PeerCapabilityIPv6Overlay = 2;
+  // Client binary includes the SCION transport.
+  PeerCapabilityScion = 3;
 }
 
 // PeerSystemMeta is machine meta data like OS and version.
@@ -252,6 +254,7 @@ message PeerSystemMeta {
   Flags flags = 17;
 
   repeated PeerCapability capabilities = 18;
+  string scionAddress = 19;
 }
 
 message LoginResponse {
@@ -486,6 +489,7 @@ message RemotePeerConfig {
   string fqdn = 4;
 
   string agentVersion = 5;
+  string scionAddress = 6;
 }
 
 // SSHConfig represents SSH configurations of a peer.

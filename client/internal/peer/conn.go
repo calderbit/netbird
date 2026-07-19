@@ -25,9 +25,11 @@ import (
 	"github.com/netbirdio/netbird/client/internal/peer/worker"
 	"github.com/netbirdio/netbird/client/internal/portforward"
 	"github.com/netbirdio/netbird/client/internal/rosenpass"
+	"github.com/netbirdio/netbird/client/internal/scion"
 	"github.com/netbirdio/netbird/client/internal/stdnet"
 	"github.com/netbirdio/netbird/route"
 	relayClient "github.com/netbirdio/netbird/shared/relay/client"
+	"github.com/netbirdio/netbird/shared/scionaddr"
 )
 
 // wgTimeoutEscalationThreshold is the number of consecutive WireGuard
@@ -55,6 +57,7 @@ type ServiceDependencies struct {
 	PeerConnDispatcher *dispatcher.ConnectionDispatcher
 	PortForwardManager *portforward.Manager
 	MetricsRecorder    MetricsRecorder
+	SCIONManager       *scion.Manager
 }
 
 type WgConfig struct {
@@ -82,6 +85,7 @@ type ConnConfig struct {
 	LocalKey string
 
 	AgentVersion string
+	SCIONAddress scionaddr.Address
 
 	Timeout time.Duration
 
@@ -107,6 +111,7 @@ type Conn struct {
 	relayManager       *relayClient.Manager
 	srWatcher          *guard.SRWatcher
 	portForwardManager *portforward.Manager
+	scionMgr           *scion.Manager
 
 	onConnected                               func(remoteWireGuardKey string, remoteRosenpassPubKey []byte, wireGuardIP string, remoteRosenpassAddr string)
 	onDisconnected                            func(remotePeer string)
@@ -114,11 +119,13 @@ type Conn struct {
 
 	statusRelay         *worker.AtomicWorkerStatus
 	statusICE           *worker.AtomicWorkerStatus
+	statusSCION         *worker.AtomicWorkerStatus
 	currentConnPriority conntype.ConnPriority
 	opened              bool // this flag is used to prevent close in case of not opened connection
 
 	workerICE   *WorkerICE
 	workerRelay *WorkerRelay
+	workerSCION *WorkerSCION
 
 	wgWatcher       *WGWatcher
 	wgWatcherWg     sync.WaitGroup
@@ -128,11 +135,16 @@ type Conn struct {
 	wgTimeouts int
 
 	// used to store the remote Rosenpass key for Relayed connection in case of connection update from ice
-	rosenpassRemoteKey []byte
+	rosenpassRemoteKey  []byte
+	rosenpassRemoteAddr string
 
-	wgProxyICE   wgproxy.Proxy
-	wgProxyRelay wgproxy.Proxy
-	handshaker   *Handshaker
+	wgProxyICE     wgproxy.Proxy
+	wgProxyRelay   wgproxy.Proxy
+	wgProxySCION   wgproxy.Proxy
+	scionProxyConn *scion.PeerConn
+	iceEndpoint    *net.UDPAddr
+	icePriority    conntype.ConnPriority
+	handshaker     *Handshaker
 
 	guard *guard.Guard
 	wg    sync.WaitGroup
@@ -199,8 +211,10 @@ func NewConn(config ConnConfig, services ServiceDependencies) (*Conn, error) {
 		relayManager:       services.RelayManager,
 		srWatcher:          services.SrWatcher,
 		portForwardManager: services.PortForwardManager,
+		scionMgr:           services.SCIONManager,
 		statusRelay:        worker.NewAtomicStatus(),
 		statusICE:          worker.NewAtomicStatus(),
+		statusSCION:        worker.NewAtomicStatus(),
 		dumpState:          dumpState,
 		endpointUpdater:    NewEndpointUpdater(connLog, config.WgConfig, isController(config)),
 		metricsRecorder:    services.MetricsRecorder,
@@ -247,6 +261,10 @@ func (conn *Conn) open(engineCtx context.Context, firstPacket []byte) error {
 		conn.workerICE = workerICE
 	}
 
+	if !forceRelay && conn.scionMgr != nil && shouldCreateSCIONWorker(conn.scionMgr.Status(), conn.config.SCIONAddress) {
+		conn.workerSCION = NewWorkerSCION(conn.ctx, conn.Log, conn.scionMgr, conn.config, conn)
+	}
+
 	conn.handshaker = NewHandshaker(conn.Log, conn.config, conn.signaler, conn.workerICE, conn.workerRelay, conn.metricsStages)
 
 	conn.handshaker.AddRelayListener(conn.workerRelay.OnNewOffer)
@@ -282,6 +300,9 @@ func (conn *Conn) open(engineCtx context.Context, firstPacket []byte) error {
 		conn.pendingFirstPacket = slices.Clone(firstPacket)
 	}
 	conn.opened = true
+	if conn.workerSCION != nil {
+		go conn.workerSCION.Start()
+	}
 	return nil
 }
 
@@ -312,6 +333,9 @@ func (conn *Conn) Close(signalToRemote bool) {
 	if conn.workerICE != nil {
 		conn.workerICE.Close()
 	}
+	if conn.workerSCION != nil {
+		conn.workerSCION.Close()
+	}
 
 	if conn.wgProxyRelay != nil {
 		err := conn.wgProxyRelay.CloseConn()
@@ -319,6 +343,14 @@ func (conn *Conn) Close(signalToRemote bool) {
 			conn.Log.Errorf("failed to close wg proxy for relay: %v", err)
 		}
 		conn.wgProxyRelay = nil
+	}
+
+	if conn.wgProxySCION != nil {
+		if err := conn.wgProxySCION.CloseConn(); err != nil {
+			conn.Log.Warnf("close SCION proxy: %v", err)
+		}
+		conn.wgProxySCION = nil
+		conn.scionProxyConn = nil
 	}
 
 	if conn.wgProxyICE != nil {
@@ -417,16 +449,7 @@ func (conn *Conn) onICEConnectionIsReady(priority conntype.ConnPriority, iceConn
 		return
 	}
 
-	// this never should happen, because Relay is the lower priority and ICE always close the deprecated connection before upgrade
-	// todo consider to remove this check
-	if conn.currentConnPriority > priority {
-		conn.Log.Infof("current connection priority (%s) is higher than the new one (%s), do not upgrade connection", conn.currentConnPriority, priority)
-		conn.statusICE.SetConnected()
-		conn.updateIceState(iceConnInfo, time.Now())
-		return
-	}
-
-	conn.Log.Infof("set ICE to active connection")
+	conn.Log.Infof("ICE connection is ready")
 	conn.dumpState.P2PConnected()
 
 	var (
@@ -436,7 +459,7 @@ func (conn *Conn) onICEConnectionIsReady(priority conntype.ConnPriority, iceConn
 	)
 	if iceConnInfo.RelayedOnLocal {
 		conn.dumpState.NewLocalProxy()
-		wgProxy, err = conn.newProxy(iceConnInfo.RemoteConn)
+		wgProxy, err = conn.newProxy(iceConnInfo.RemoteConn, 1)
 		if err != nil {
 			conn.Log.Errorf("failed to add turn net.Conn to local proxy: %v", err)
 			return
@@ -453,24 +476,51 @@ func (conn *Conn) onICEConnectionIsReady(priority conntype.ConnPriority, iceConn
 		ep = directEp
 	}
 
-	if conn.wgProxyRelay != nil {
-		conn.wgProxyRelay.Pause()
-	}
-
-	if wgProxy != nil {
-		wgProxy.Work()
-	}
-
-	conn.Log.Infof("configure WireGuard endpoint to: %s", ep.String())
+	conn.iceEndpoint = ep
+	conn.icePriority = priority
+	conn.cacheRosenpassCredentialsLocked(iceConnInfo.RosenpassPubKey, iceConnInfo.RosenpassAddr)
 	updateTime := time.Now()
-	conn.enableWgWatcherIfNeeded(updateTime)
+	if conn.currentConnPriority > priority {
+		conn.Log.Infof("retain higher-priority %s connection and keep ICE on standby", conn.currentConnPriority)
+		if wgProxy != nil {
+			wgProxy.Pause()
+			if conn.wgProxySCION != nil {
+				wgProxy.RedirectAs(conn.wgProxySCION.EndpointAddr())
+			}
+		}
+		conn.statusICE.SetConnected()
+		conn.updateIceState(iceConnInfo, updateTime)
+		conn.notifyRosenpassCredentialsLocked()
+		return
+	}
 
+	conn.Log.Infof("set ICE to active connection")
+	conn.Log.Infof("configure WireGuard endpoint to: %s", ep.String())
 	presharedKey := conn.presharedKey(iceConnInfo.RosenpassPubKey)
 	if err = conn.endpointUpdater.ConfigureWGEndpoint(ep, presharedKey); err != nil {
 		conn.handleConfigurationFailure(err, wgProxy)
+		if wgProxy != nil {
+			conn.wgProxyICE = nil
+		}
 		return
 	}
+	conn.enableWgWatcherIfNeeded(updateTime)
+	if conn.wgProxyRelay != nil {
+		conn.wgProxyRelay.Pause()
+	}
+	if conn.wgProxySCION != nil {
+		conn.wgProxySCION.Pause()
+	}
+	if wgProxy != nil {
+		wgProxy.Work()
+	}
+	conn.statusICE.SetConnected()
+	conn.updateIceState(iceConnInfo, updateTime)
 	wgConfigWorkaround()
+
+	if conn.wgProxySCION != nil {
+		conn.wgProxySCION.RedirectAs(ep)
+	}
 
 	if conn.wgProxyRelay != nil {
 		conn.Log.Debugf("redirect packets from relayed conn to WireGuard")
@@ -480,8 +530,7 @@ func (conn *Conn) onICEConnectionIsReady(priority conntype.ConnPriority, iceConn
 	conn.injectPendingFirstPacket(wgProxy, iceConnInfo.RemoteConn)
 
 	conn.currentConnPriority = priority
-	conn.statusICE.SetConnected()
-	conn.updateIceState(iceConnInfo, updateTime)
+	conn.markSCIONActiveLocked(false)
 	conn.doOnConnected(iceConnInfo.RosenpassPubKey, iceConnInfo.RosenpassAddr, updateTime)
 }
 
@@ -501,23 +550,28 @@ func (conn *Conn) onICEStateDisconnected(sessionChanged bool) {
 		}
 	}
 
-	// switch back to relay connection
-	if conn.isReadyToUpgrade() {
+	// Select the best healthy standby transport.
+	if conn.workerSCION != nil && conn.workerSCION.Ready() && conn.wgProxySCION != nil {
+		priority := conntype.SCION
+		if conn.scionMgr.Prefer() {
+			priority = conntype.SCIONPreferred
+		}
+		conn.activateSCIONCandidateLocked(priority)
+	} else if conn.isReadyToUpgrade() {
 		conn.Log.Infof("ICE disconnected, set Relay to active connection")
 		conn.dumpState.SwitchToRelay()
 		if sessionChanged {
 			conn.resetEndpoint()
 		}
 
-		// todo consider to move after the ConfigureWGEndpoint
-		conn.wgProxyRelay.Work()
-
 		presharedKey := conn.presharedKey(conn.rosenpassRemoteKey)
 		if err := conn.endpointUpdater.SwitchWGEndpoint(conn.wgProxyRelay.EndpointAddr(), presharedKey); err != nil {
 			conn.Log.Errorf("failed to switch to relay conn: %v", err)
+		} else {
+			conn.wgProxyRelay.Work()
+			conn.currentConnPriority = conntype.Relay
+			conn.markSCIONActiveLocked(false)
 		}
-
-		conn.currentConnPriority = conntype.Relay
 	} else {
 		conn.Log.Infof("ICE disconnected, do not switch to Relay. Reset priority to: %s", conntype.None.String())
 		conn.currentConnPriority = conntype.None
@@ -531,6 +585,7 @@ func (conn *Conn) onICEStateDisconnected(sessionChanged bool) {
 		conn.guard.SetICEConnDisconnected()
 	}
 	conn.statusICE.SetDisconnected()
+	conn.activateBestTransportLocked()
 
 	conn.disableWgWatcherIfNeeded()
 
@@ -549,6 +604,178 @@ func (conn *Conn) onICEStateDisconnected(sessionChanged bool) {
 	}
 }
 
+func (conn *Conn) onSCIONConnectionIsReady(worker *WorkerSCION, generation uint64, remoteConn *scion.PeerConn) {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	if conn.ctx.Err() != nil || !worker.isCurrent(generation, remoteConn) {
+		return
+	}
+	if conn.wgProxySCION != nil && conn.scionProxyConn == remoteConn {
+		conn.statusSCION.SetConnected()
+		conn.activateBestTransportLocked()
+		return
+	}
+	if conn.wgProxySCION != nil {
+		_ = conn.wgProxySCION.CloseConn()
+		conn.wgProxySCION = nil
+		conn.scionProxyConn = nil
+	}
+	proxy, err := conn.newProxy(remoteConn, 3)
+	if err != nil {
+		conn.Log.Errorf("failed to add SCION connection to local proxy: %v", err)
+		return
+	}
+	conn.wgProxySCION = proxy
+	conn.scionProxyConn = remoteConn
+	conn.statusSCION.SetConnected()
+	conn.activateBestTransportLocked()
+}
+
+func (conn *Conn) activateSCIONCandidateLocked(priority conntype.ConnPriority) {
+	if conn.wgProxySCION == nil {
+		return
+	}
+	endpoint := conn.wgProxySCION.EndpointAddr()
+	updateTime := time.Now()
+	if err := conn.endpointUpdater.SwitchWGEndpoint(endpoint, conn.presharedKey(conn.rosenpassRemoteKey)); err != nil {
+		conn.Log.Errorf("failed to activate SCION endpoint: %v", err)
+		return
+	}
+	conn.enableWgWatcherIfNeeded(updateTime)
+	if conn.wgProxyICE != nil {
+		conn.wgProxyICE.Pause()
+	}
+	if conn.wgProxyRelay != nil {
+		conn.wgProxyRelay.Pause()
+	}
+	conn.wgProxySCION.Work()
+	if conn.wgProxyICE != nil {
+		conn.wgProxyICE.RedirectAs(endpoint)
+	}
+	if conn.wgProxyRelay != nil {
+		conn.wgProxyRelay.RedirectAs(endpoint)
+	}
+	conn.currentConnPriority = priority
+	conn.markSCIONActiveLocked(true)
+	conn.doOnConnected(conn.rosenpassRemoteKey, conn.rosenpassRemoteAddr, updateTime)
+}
+
+func (conn *Conn) onSCIONStateDisconnected(worker *WorkerSCION, generation uint64) {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	if worker.isCurrent(generation, nil) {
+		conn.handleSCIONDisconnectedLocked()
+	}
+}
+
+func (conn *Conn) handleSCIONDisconnectedLocked() {
+	conn.statusSCION.SetDisconnected()
+	conn.activateBestTransportLocked()
+}
+
+// activateBestTransportLocked is the single selector for ready relay, ICE, and
+// SCION candidates. Caller must hold conn.mu.
+func (conn *Conn) activateBestTransportLocked() {
+	relayReady := conn.statusRelay.Get() == worker.StatusConnected && conn.wgProxyRelay != nil
+	iceReady := conn.statusICE.Get() == worker.StatusConnected && conn.iceEndpoint != nil
+	scionReady := conn.statusSCION.Get() == worker.StatusConnected && conn.wgProxySCION != nil
+	best := bestTransportPriority(relayReady, iceReady, conn.icePriority, scionReady, conn.scionMgr != nil && conn.scionMgr.Prefer())
+	if best == conn.currentConnPriority {
+		return
+	}
+	switch best {
+	case conntype.SCION, conntype.SCIONPreferred:
+		conn.activateSCIONCandidateLocked(best)
+	case conntype.ICEP2P, conntype.ICETurn:
+		updateTime := time.Now()
+		if err := conn.endpointUpdater.SwitchWGEndpoint(conn.iceEndpoint, conn.presharedKey(conn.rosenpassRemoteKey)); err != nil {
+			conn.Log.Errorf("failed to activate ICE endpoint: %v", err)
+			return
+		}
+		conn.enableWgWatcherIfNeeded(updateTime)
+		if conn.wgProxySCION != nil {
+			conn.wgProxySCION.Pause()
+			conn.wgProxySCION.RedirectAs(conn.iceEndpoint)
+		}
+		if conn.wgProxyRelay != nil {
+			conn.wgProxyRelay.Pause()
+			conn.wgProxyRelay.RedirectAs(conn.iceEndpoint)
+		}
+		if conn.wgProxyICE != nil {
+			conn.wgProxyICE.Work()
+		}
+		conn.currentConnPriority = best
+		conn.markSCIONActiveLocked(false)
+		conn.doOnConnected(conn.rosenpassRemoteKey, conn.rosenpassRemoteAddr, updateTime)
+	case conntype.Relay:
+		endpoint := conn.wgProxyRelay.EndpointAddr()
+		updateTime := time.Now()
+		if err := conn.endpointUpdater.SwitchWGEndpoint(endpoint, conn.presharedKey(conn.rosenpassRemoteKey)); err != nil {
+			conn.Log.Errorf("failed to activate relay endpoint: %v", err)
+			return
+		}
+		conn.enableWgWatcherIfNeeded(updateTime)
+		if conn.wgProxySCION != nil {
+			conn.wgProxySCION.Pause()
+			conn.wgProxySCION.RedirectAs(endpoint)
+		}
+		if conn.wgProxyICE != nil {
+			conn.wgProxyICE.Pause()
+			conn.wgProxyICE.RedirectAs(endpoint)
+		}
+		conn.wgProxyRelay.Work()
+		conn.currentConnPriority = best
+		conn.markSCIONActiveLocked(false)
+		conn.doOnConnected(conn.rosenpassRemoteKey, conn.rosenpassRemoteAddr, updateTime)
+	default:
+		conn.currentConnPriority = conntype.None
+		_ = conn.config.WgConfig.WgInterface.RemoveEndpointAddress(conn.config.WgConfig.RemoteKey)
+		conn.markSCIONActiveLocked(false)
+	}
+}
+
+func shouldCreateSCIONWorker(state scion.State, remote scionaddr.Address) bool {
+	return state.Supported && state.Enabled && remote.Host.IsValid()
+}
+
+func bestTransportPriority(relayReady, iceReady bool, icePriority conntype.ConnPriority, scionReady, preferSCION bool) conntype.ConnPriority {
+	best := conntype.None
+	if relayReady {
+		best = conntype.Relay
+	}
+	if iceReady && icePriority > best {
+		best = icePriority
+	}
+	if scionReady {
+		scionPriority := conntype.SCION
+		if preferSCION {
+			scionPriority = conntype.SCIONPreferred
+		}
+		if scionPriority > best {
+			best = scionPriority
+		}
+	}
+	return best
+}
+
+func (conn *Conn) markSCIONActiveLocked(active bool) {
+	if conn.statusRecorder != nil {
+		_ = conn.statusRecorder.UpdatePeerSCIONTransport(conn.config.Key, active, conn.evalStatus(), conn.isRelayed())
+	}
+}
+
+func (conn *Conn) updateSCIONState(worker *WorkerSCION, generation uint64, state scion.PeerState) {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	if !worker.isCurrent(generation, nil) {
+		return
+	}
+	active := conn.currentConnPriority == conntype.SCION || conn.currentConnPriority == conntype.SCIONPreferred
+	if conn.statusRecorder != nil {
+		_ = conn.statusRecorder.UpdatePeerSCIONState(conn.config.Key, state, active)
+	}
+}
+
 func (conn *Conn) onRelayConnectionIsReady(rci RelayConnInfo) {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
@@ -563,7 +790,7 @@ func (conn *Conn) onRelayConnectionIsReady(rci RelayConnInfo) {
 	conn.dumpState.RelayConnected()
 	conn.Log.Debugf("Relay connection has been established, setup the WireGuard")
 
-	wgProxy, err := conn.newProxy(rci.relayedConn)
+	wgProxy, err := conn.newProxy(rci.relayedConn, 1)
 	if err != nil {
 		conn.Log.Errorf("failed to add relayed net.Conn to local proxy: %v", err)
 		return
@@ -573,12 +800,14 @@ func (conn *Conn) onRelayConnectionIsReady(rci RelayConnInfo) {
 	conn.dumpState.NewLocalProxy()
 
 	conn.Log.Infof("created new wgProxy for relay connection: %s", wgProxy.EndpointAddr().String())
+	conn.cacheRosenpassCredentialsLocked(rci.rosenpassPubKey, rci.rosenpassAddr)
 
-	if conn.isICEActive() {
+	if conn.currentConnPriority > conntype.Relay {
 		conn.Log.Debugf("do not switch to relay because current priority is: %s", conn.currentConnPriority.String())
 		conn.setRelayedProxy(wgProxy)
 		conn.statusRelay.SetConnected()
 		conn.updateRelayStatus(rci.relayedConn.RemoteAddr().String(), rci.rosenpassPubKey, time.Now())
+		conn.notifyRosenpassCredentialsLocked()
 		return
 	}
 
@@ -604,8 +833,8 @@ func (conn *Conn) onRelayConnectionIsReady(rci RelayConnInfo) {
 
 	conn.injectPendingFirstPacket(wgProxy, nil)
 
-	conn.rosenpassRemoteKey = rci.rosenpassPubKey
 	conn.currentConnPriority = conntype.Relay
+	conn.markSCIONActiveLocked(false)
 	conn.statusRelay.SetConnected()
 	conn.setRelayedProxy(wgProxy)
 	conn.updateRelayStatus(rci.relayedConn.RemoteAddr().String(), rci.rosenpassPubKey, updateTime)
@@ -628,10 +857,18 @@ func (conn *Conn) handleRelayDisconnectedLocked() {
 	conn.Log.Debugf("relay connection is disconnected")
 
 	if conn.currentConnPriority == conntype.Relay {
-		conn.Log.Debugf("clean up WireGuard config")
-		conn.currentConnPriority = conntype.None
-		if err := conn.config.WgConfig.WgInterface.RemoveEndpointAddress(conn.config.WgConfig.RemoteKey); err != nil {
-			conn.Log.Errorf("failed to remove wg endpoint: %v", err)
+		if conn.workerSCION != nil && conn.workerSCION.Ready() && conn.wgProxySCION != nil {
+			priority := conntype.SCION
+			if conn.scionMgr.Prefer() {
+				priority = conntype.SCIONPreferred
+			}
+			conn.activateSCIONCandidateLocked(priority)
+		} else {
+			conn.Log.Debugf("clean up WireGuard config")
+			conn.currentConnPriority = conntype.None
+			if err := conn.config.WgConfig.WgInterface.RemoveEndpointAddress(conn.config.WgConfig.RemoteKey); err != nil {
+				conn.Log.Errorf("failed to remove wg endpoint: %v", err)
+			}
 		}
 	}
 
@@ -645,6 +882,7 @@ func (conn *Conn) handleRelayDisconnectedLocked() {
 		conn.guard.SetRelayedConnDisconnected()
 	}
 	conn.statusRelay.SetDisconnected()
+	conn.activateBestTransportLocked()
 
 	conn.disableWgWatcherIfNeeded()
 
@@ -688,6 +926,20 @@ func (conn *Conn) onWGDisconnected(watcherCtx context.Context) {
 		conn.handleRelayDisconnectedLocked()
 	case conntype.ICEP2P, conntype.ICETurn:
 		conn.workerICE.Close()
+	case conntype.SCION, conntype.SCIONPreferred:
+		conn.handleSCIONDisconnectedLocked()
+		if conn.wgProxySCION != nil {
+			_ = conn.wgProxySCION.CloseConn()
+			conn.wgProxySCION = nil
+			conn.scionProxyConn = nil
+		}
+		// A failed fallback endpoint update leaves the old SCION priority in place.
+		// Clear it after closing the old proxy so replacement readiness cannot be skipped.
+		if conn.currentConnPriority == conntype.SCION || conn.currentConnPriority == conntype.SCIONPreferred {
+			conn.currentConnPriority = conntype.None
+			conn.markSCIONActiveLocked(false)
+		}
+		conn.workerSCION.Reset()
 	default:
 		conn.Log.Debugf("No active connection to close on WG timeout")
 	}
@@ -754,6 +1006,7 @@ func (conn *Conn) updateIceState(iceConnInfo ICEConnInfo, updateTime time.Time) 
 func (conn *Conn) setStatusToDisconnected() {
 	conn.statusRelay.SetDisconnected()
 	conn.statusICE.SetDisconnected()
+	conn.statusSCION.SetDisconnected()
 	conn.currentConnPriority = conntype.None
 
 	peerState := State{
@@ -770,6 +1023,21 @@ func (conn *Conn) setStatusToDisconnected() {
 	}
 	if err := conn.statusRecorder.UpdateWireGuardPeerState(conn.config.Key, configurer.WGStats{}); err != nil {
 		conn.Log.Debugf("failed to reset wireguard stats for peer: %s", err)
+	}
+}
+
+func (conn *Conn) cacheRosenpassCredentialsLocked(remoteKey []byte, remoteAddr string) {
+	if remoteKey != nil {
+		conn.rosenpassRemoteKey = slices.Clone(remoteKey)
+	}
+	if remoteAddr != "" {
+		conn.rosenpassRemoteAddr = remoteAddr
+	}
+}
+
+func (conn *Conn) notifyRosenpassCredentialsLocked() {
+	if conn.onConnected != nil && (len(conn.rosenpassRemoteKey) > 0 || conn.rosenpassRemoteAddr != "") {
+		conn.onConnected(conn.config.Key, conn.rosenpassRemoteKey, conn.config.WgConfig.AllowedIps[0].Addr().String(), conn.rosenpassRemoteAddr)
 	}
 }
 
@@ -795,7 +1063,7 @@ func (conn *Conn) isRelayed() bool {
 }
 
 func (conn *Conn) evalStatus() ConnStatus {
-	if conn.statusRelay.Get() == worker.StatusConnected || conn.statusICE.Get() == worker.StatusConnected {
+	if conn.statusRelay.Get() == worker.StatusConnected || conn.statusICE.Get() == worker.StatusConnected || conn.statusSCION.Get() == worker.StatusConnected {
 		return StatusConnected
 	}
 
@@ -816,10 +1084,14 @@ func (conn *Conn) isConnectedOnAllWay() (status guard.ConnStatus) {
 	}()
 
 	iceWorkerCreated := conn.workerICE != nil
-
 	var iceInProgress bool
 	if iceWorkerCreated {
 		iceInProgress = conn.workerICE.InProgress()
+	}
+	scionWorkerCreated := conn.workerSCION != nil
+	var scionInProgress bool
+	if scionWorkerCreated {
+		scionInProgress = conn.workerSCION.InProgress()
 	}
 
 	return evalConnStatus(connStatusInputs{
@@ -830,6 +1102,9 @@ func (conn *Conn) isConnectedOnAllWay() (status guard.ConnStatus) {
 		iceWorkerCreated:    iceWorkerCreated,
 		iceStatusConnecting: conn.statusICE.Get() != worker.StatusDisconnected,
 		iceInProgress:       iceInProgress,
+		scionWorkerCreated:  scionWorkerCreated,
+		scionConnected:      conn.statusSCION.Get() == worker.StatusConnected,
+		scionInProgress:     scionInProgress,
 	})
 }
 
@@ -868,7 +1143,7 @@ func (conn *Conn) disableWgWatcherIfNeeded() {
 	conn.wgWatcherCancel = nil
 }
 
-func (conn *Conn) newProxy(remoteConn net.Conn) (wgproxy.Proxy, error) {
+func (conn *Conn) newProxy(remoteConn net.Conn, fakePrefix byte) (wgproxy.Proxy, error) {
 	conn.Log.Debugf("setup proxied WireGuard connection")
 	udpAddr := &net.UDPAddr{
 		IP:   conn.config.WgConfig.AllowedIps[0].Addr().AsSlice(),
@@ -876,7 +1151,7 @@ func (conn *Conn) newProxy(remoteConn net.Conn) (wgproxy.Proxy, error) {
 	}
 
 	wgProxy := conn.config.WgConfig.WgInterface.GetProxy()
-	if err := wgProxy.AddTurnConn(conn.ctx, udpAddr, remoteConn); err != nil {
+	if err := wgProxy.AddTurnConn(conn.ctx, udpAddr, remoteConn, fakePrefix); err != nil {
 		conn.Log.Errorf("failed to add turn net.Conn to local proxy: %v", err)
 		return nil, err
 	}
@@ -963,6 +1238,8 @@ func (conn *Conn) recordConnectionMetrics() {
 	switch priority {
 	case conntype.Relay:
 		connType = metrics.ConnectionTypeRelay
+	case conntype.SCION, conntype.SCIONPreferred:
+		connType = metrics.ConnectionTypeSCION
 	default:
 		connType = metrics.ConnectionTypeICE
 	}
@@ -980,6 +1257,13 @@ func (conn *Conn) recordConnectionMetrics() {
 // AllowedIP returns the allowed IP of the remote peer
 func (conn *Conn) AllowedIP() netip.Addr {
 	return conn.config.WgConfig.AllowedIps[0].Addr()
+}
+
+func (conn *Conn) SCIONAddressString() string {
+	if !conn.config.SCIONAddress.Host.IsValid() {
+		return ""
+	}
+	return conn.config.SCIONAddress.String()
 }
 
 func (conn *Conn) AgentVersionString() string {
@@ -1027,36 +1311,25 @@ func isRosenpassEnabled(remoteRosenpassPubKey []byte) bool {
 }
 
 func evalConnStatus(in connStatusInputs) guard.ConnStatus {
-	// "Relay up and needed" — the peer uses relay and the transport is connected.
 	relayUsedAndUp := in.peerUsesRelay && in.relayConnected
-
-	// Force-relay mode: ICE never runs. Relay is the only transport and must be up.
 	if in.forceRelay {
 		return boolToConnStatus(relayUsedAndUp)
 	}
 
-	// Remote peer doesn't support ICE, or we haven't created the worker yet:
-	// relay is the only possible transport.
-	if !in.remoteSupportsICE || !in.iceWorkerCreated {
+	iceExpected := in.remoteSupportsICE && in.iceWorkerCreated
+	if !iceExpected && !in.scionWorkerCreated {
 		return boolToConnStatus(relayUsedAndUp)
 	}
-
-	// ICE counts as "up" when the status is anything other than Disconnected, OR
-	// when a negotiation is currently in progress (so we don't spam offers while one is in flight).
-	iceUp := in.iceStatusConnecting || in.iceInProgress
-
-	// Relay side is acceptable if the peer doesn't rely on relay, or relay is connected.
+	iceOK := !iceExpected || in.iceStatusConnecting || in.iceInProgress
+	scionOK := !in.scionWorkerCreated || in.scionConnected || in.scionInProgress
 	relayOK := !in.peerUsesRelay || in.relayConnected
-
-	switch {
-	case iceUp && relayOK:
+	if iceOK && scionOK && relayOK {
 		return guard.ConnStatusConnected
-	case relayUsedAndUp:
-		// Relay is up but ICE is down — partially connected.
-		return guard.ConnStatusPartiallyConnected
-	default:
-		return guard.ConnStatusDisconnected
 	}
+	if relayUsedAndUp || in.scionConnected {
+		return guard.ConnStatusPartiallyConnected
+	}
+	return guard.ConnStatusDisconnected
 }
 
 func boolToConnStatus(connected bool) guard.ConnStatus {

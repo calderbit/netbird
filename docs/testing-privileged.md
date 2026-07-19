@@ -32,7 +32,7 @@ list; both are optional and default to the full privileged suite.
 
 1. Skips immediately when it detects it is already inside the container
    (`DOCKER_CI=true`), so the privileged tests run in place instead of recursing.
-2. Otherwise spins up a `golang:1.25-alpine` container (matching CI),
+2. Otherwise spins up a `golang:1.26-alpine` container (matching CI),
    bind-mounts the repo and the host Go build/module caches, installs the
    required packages, and runs `go test -tags 'devcert privileged'` over the
    client packages.
@@ -61,6 +61,10 @@ tests (and any shared data — type/var declarations, table-driven `testCases`,
 helper interfaces) in an untagged file, and move the privileged tests into a
 `*_privileged_test.go` file with the tag. Shared declarations must stay untagged,
 otherwise the unprivileged files in the package will not compile.
+
+SCION topology integration additionally needs CGO, the `scion` build tag, and a
+privileged local SCION topology. Keep topology state outside the repository and
+run tagged clients with distinct `NB_SCION_PORT` values.
 
 Always verify both build modes compile on every target platform:
 

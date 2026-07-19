@@ -22,6 +22,7 @@ import (
 	probeRelay "github.com/netbirdio/netbird/client/internal/relay"
 	"github.com/netbirdio/netbird/client/proto"
 	"github.com/netbirdio/netbird/shared/management/domain"
+	"github.com/netbirdio/netbird/shared/scionaddr"
 	"github.com/netbirdio/netbird/version"
 )
 
@@ -78,6 +79,9 @@ type PeerStateDetailOutput struct {
 	Latency                time.Duration    `json:"latency" yaml:"latency"`
 	RosenpassEnabled       bool             `json:"quantumResistance" yaml:"quantumResistance"`
 	Networks               []string         `json:"networks" yaml:"networks"`
+	ScionPath              string           `json:"scionPath,omitempty" yaml:"scionPath,omitempty"`
+	ScionLatency           time.Duration    `json:"scionLatency,omitempty" yaml:"scionLatency,omitempty"`
+	ScionPathCount         int              `json:"scionPathCount,omitempty" yaml:"scionPathCount,omitempty"`
 }
 
 type PeersStateOutput struct {
@@ -136,6 +140,17 @@ type SSHServerStateOutput struct {
 	Sessions []SSHSessionOutput `json:"sessions" yaml:"sessions"`
 }
 
+type ScionStateOutput struct {
+	Supported      bool   `json:"supported" yaml:"supported"`
+	Enabled        bool   `json:"enabled" yaml:"enabled"`
+	Active         bool   `json:"active" yaml:"active"`
+	LocalIA        string `json:"localIA,omitempty" yaml:"localIA,omitempty"`
+	LocalAddress   string `json:"localAddress,omitempty" yaml:"localAddress,omitempty"`
+	ConnectedPeers int    `json:"connectedPeers" yaml:"connectedPeers"`
+	LastError      string `json:"lastError,omitempty" yaml:"lastError,omitempty"`
+	RefreshHealth  string `json:"refreshHealth,omitempty" yaml:"refreshHealth,omitempty"`
+}
+
 type OutputOverview struct {
 	Peers                   PeersStateOutput           `json:"peers" yaml:"peers"`
 	CliVersion              string                     `json:"cliVersion" yaml:"cliVersion"`
@@ -159,6 +174,7 @@ type OutputOverview struct {
 	LazyConnectionEnabled   bool                       `json:"lazyConnectionEnabled" yaml:"lazyConnectionEnabled"`
 	ProfileName             string                     `json:"profileName" yaml:"profileName"`
 	SSHServerState          SSHServerStateOutput       `json:"sshServer" yaml:"sshServer"`
+	ScionState              ScionStateOutput           `json:"scion" yaml:"scion"`
 	// SessionExpiresAt is the absolute UTC instant at which the peer's SSO
 	// session expires. nil when the peer is not SSO-tracked or login
 	// expiration is disabled. Pointer (rather than zero-value time.Time) so
@@ -209,6 +225,7 @@ func ConvertToStatusOutputOverview(pbFullStatus *proto.FullStatus, opts ConvertO
 		LazyConnectionEnabled:   pbFullStatus.GetLazyConnectionEnabled(),
 		ProfileName:             opts.ProfileName,
 		SSHServerState:          sshServerOverview,
+		ScionState:              ScionStateOutput{Supported: pbFullStatus.GetScionState().GetSupported(), Enabled: pbFullStatus.GetScionState().GetEnabled(), Active: pbFullStatus.GetScionState().GetActive(), LocalIA: pbFullStatus.GetScionState().GetLocalIA(), LocalAddress: pbFullStatus.GetScionState().GetLocalAddress(), ConnectedPeers: int(pbFullStatus.GetScionState().GetConnectedPeers()), LastError: pbFullStatus.GetScionState().GetLastError(), RefreshHealth: pbFullStatus.GetScionState().GetRefreshHealth()},
 	}
 	if !opts.SessionExpiresAt.IsZero() {
 		t := opts.SessionExpiresAt
@@ -318,9 +335,13 @@ func mapPeers(
 		isPeerConnected := pbPeerState.ConnStatus == peer.StatusConnected.String()
 
 		if isPeerConnected {
-			connType = "P2P"
-			if pbPeerState.Relayed {
+			switch {
+			case pbPeerState.GetScionActive():
+				connType = "SCION"
+			case pbPeerState.Relayed:
 				connType = "Relayed"
+			default:
+				connType = "P2P"
 			}
 		}
 
@@ -364,6 +385,9 @@ func mapPeers(
 			Latency:                pbPeerState.GetLatency().AsDuration(),
 			RosenpassEnabled:       pbPeerState.GetRosenpassEnabled(),
 			Networks:               pbPeerState.GetNetworks(),
+			ScionPath:              pbPeerState.GetScionPath(),
+			ScionLatency:           pbPeerState.GetScionLatency().AsDuration(),
+			ScionPathCount:         int(pbPeerState.GetScionPathCount()),
 		}
 
 		peersStateDetail = append(peersStateDetail, peerState)
@@ -574,6 +598,19 @@ func (o *OutputOverview) GeneralSummary(showURL bool, showRelays bool, showNameS
 		forwardingRulesString = fmt.Sprintf("Forwarding rules: %d\n", o.NumberOfForwardingRules)
 	}
 
+	var scionString string
+	if o.ScionState.Supported || o.ScionState.Enabled {
+		status := "Inactive"
+		if o.ScionState.Active {
+			status = "Active"
+		}
+		errorText := ""
+		if o.ScionState.LastError != "" {
+			errorText = ", error " + o.ScionState.LastError
+		}
+		scionString = fmt.Sprintf("SCION: %s, IA %s, address %s, peers %d, refresh %s%s\n", status, o.ScionState.LocalIA, o.ScionState.LocalAddress, o.ScionState.ConnectedPeers, o.ScionState.RefreshHealth, errorText)
+	}
+
 	goos := runtime.GOOS
 	goarch := runtime.GOARCH
 	goarm := ""
@@ -616,6 +653,7 @@ func (o *OutputOverview) GeneralSummary(showURL bool, showRelays bool, showNameS
 			"Networks: %s\n"+
 			"%s"+
 			"%s"+
+			"%s"+
 			"Peers count: %s\n",
 		fmt.Sprintf("%s/%s%s", goos, goarch, goarm),
 		daemonVersion,
@@ -636,6 +674,7 @@ func (o *OutputOverview) GeneralSummary(showURL bool, showRelays bool, showNameS
 		networks,
 		forwardingRulesString,
 		sessionExpiryString,
+		scionString,
 		peersCountString,
 	)
 	return summary
@@ -665,6 +704,7 @@ func ToProtoFullStatus(fullStatus peer.FullStatus) *proto.FullStatus {
 		SignalState:     &proto.SignalState{},
 		LocalPeerState:  &proto.LocalPeerState{},
 		Peers:           []*proto.PeerState{},
+		ScionState:      &proto.ScionState{Supported: fullStatus.ScionState.Supported, Enabled: fullStatus.ScionState.Enabled, Active: fullStatus.ScionState.Active, LocalIA: fullStatus.ScionState.LocalIA, LocalAddress: fullStatus.ScionState.LocalAddress, ConnectedPeers: int32(fullStatus.ScionState.ConnectedPeers), LastError: fullStatus.ScionState.LastError, RefreshHealth: fullStatus.ScionState.RefreshHealth},
 	}
 
 	pbFullStatus.ManagementState.URL = fullStatus.ManagementState.URL
@@ -711,6 +751,10 @@ func ToProtoFullStatus(fullStatus peer.FullStatus) *proto.FullStatus {
 			Networks:                   maps.Keys(peerState.GetRoutes()),
 			Latency:                    durationpb.New(peerState.Latency),
 			SshHostKey:                 peerState.SSHHostKey,
+			ScionActive:                peerState.ScionActive,
+			ScionPath:                  peerState.ScionPath,
+			ScionLatency:               durationpb.New(peerState.ScionLatency),
+			ScionPathCount:             int32(peerState.ScionPathCount),
 		}
 		pbFullStatus.Peers = append(pbFullStatus.Peers, pbPeerState)
 	}
@@ -805,6 +849,10 @@ func parsePeers(peers PeersStateOutput, rosenpassEnabled, rosenpassPermissive bo
 		if peerState.IPv6 != "" {
 			ipv6Line = fmt.Sprintf("  NetBird IPv6: %s\n", peerState.IPv6)
 		}
+		scionLine := ""
+		if peerState.ScionPath != "" || peerState.ScionPathCount > 0 {
+			scionLine = fmt.Sprintf("  SCION path: %s (%s, %d candidates)\n", peerState.ScionPath, peerState.ScionLatency, peerState.ScionPathCount)
+		}
 
 		peerString := fmt.Sprintf(
 			"\n %s:\n"+
@@ -814,6 +862,7 @@ func parsePeers(peers PeersStateOutput, rosenpassEnabled, rosenpassPermissive bo
 				"  Status: %s\n"+
 				"  -- detail --\n"+
 				"  Connection type: %s\n"+
+				"%s"+
 				"  ICE candidate (Local/Remote): %s/%s\n"+
 				"  ICE candidate endpoints (Local/Remote): %s/%s\n"+
 				"  Relay server address: %s\n"+
@@ -829,6 +878,7 @@ func parsePeers(peers PeersStateOutput, rosenpassEnabled, rosenpassPermissive bo
 			peerState.PubKey,
 			peerState.Status,
 			peerState.ConnType,
+			scionLine,
 			localICE,
 			remoteICE,
 			localICEEndpoint,
@@ -985,6 +1035,7 @@ func anonymizePeerDetail(a *anonymize.Anonymizer, peer *PeerStateDetailOutput) {
 
 	peer.IPv6 = a.AnonymizeIPString(peer.IPv6)
 	peer.RelayAddress = a.AnonymizeURI(peer.RelayAddress)
+	peer.ScionPath = a.AnonymizeString(peer.ScionPath)
 
 	for i, route := range peer.Networks {
 		peer.Networks[i] = a.AnonymizeIPString(route)
@@ -1009,6 +1060,20 @@ func anonymizeOverview(a *anonymize.Anonymizer, overview *OutputOverview) {
 
 	overview.IP = a.AnonymizeIPString(overview.IP)
 	overview.IPv6 = a.AnonymizeIPString(overview.IPv6)
+	originalIA := overview.ScionState.LocalIA
+	parsedAddress, parsedAddressErr := scionaddr.Parse(overview.ScionState.LocalAddress)
+	if originalIA == "" && parsedAddressErr == nil {
+		originalIA = parsedAddress.IA
+	}
+	anonymizedIA := a.AnonymizeSCIONIA(originalIA)
+	overview.ScionState.LocalIA = anonymizedIA
+	if parsedAddressErr == nil {
+		parsedAddress.IA = anonymizedIA
+		parsedAddress.Host = netip.AddrPortFrom(netip.MustParseAddr(a.AnonymizeIPString(parsedAddress.Host.Addr().String())), parsedAddress.Host.Port())
+		overview.ScionState.LocalAddress = parsedAddress.String()
+	}
+	overview.ScionState.LastError = strings.ReplaceAll(a.AnonymizeString(overview.ScionState.LastError), originalIA, anonymizedIA)
+	overview.ScionState.RefreshHealth = strings.ReplaceAll(a.AnonymizeString(overview.ScionState.RefreshHealth), originalIA, anonymizedIA)
 	for i, detail := range overview.Relays.Details {
 		detail.URI = a.AnonymizeURI(detail.URI)
 		detail.Error = a.AnonymizeString(detail.Error)

@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/netip"
 	"runtime"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,6 +16,9 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/netbirdio/netbird/client/anonymize"
+	"github.com/netbirdio/netbird/client/internal/peer"
+	"github.com/netbirdio/netbird/client/internal/scion"
 	"github.com/netbirdio/netbird/client/proto"
 	"github.com/netbirdio/netbird/version"
 )
@@ -244,6 +250,40 @@ var overview = OutputOverview{
 	},
 }
 
+func TestToProtoFullStatusIncludesSCION(t *testing.T) {
+	full := peer.FullStatus{
+		ScionState: scion.State{Supported: true, Enabled: true, Active: true, RefreshHealth: "healthy"},
+		Peers:      []peer.State{{Mux: &sync.RWMutex{}, PubKey: "peer", ScionActive: true, ScionPath: "abcd", ScionLatency: 3 * time.Millisecond, ScionPathCount: 2}},
+	}
+	got := ToProtoFullStatus(full)
+	require.True(t, got.GetScionState().GetActive())
+	require.Equal(t, "healthy", got.GetScionState().GetRefreshHealth())
+	require.True(t, got.GetPeers()[0].GetScionActive())
+	require.Equal(t, 3*time.Millisecond, got.GetPeers()[0].GetScionLatency().AsDuration())
+}
+
+func TestSCIONMappingFilterAndAnonymization(t *testing.T) {
+	peers := []*proto.PeerState{
+		{IP: "100.64.0.1", Fqdn: "scion", ConnStatus: "Connected", ScionActive: true, ScionPath: "via 11.12.13.14", ScionLatency: durationpb.New(time.Millisecond), ScionPathCount: 2},
+		{IP: "100.64.0.2", Fqdn: "p2p", ConnStatus: "Connected"},
+	}
+	mapped := mapPeers(peers, "", nil, nil, nil, "scion")
+	require.Len(t, mapped.Details, 1)
+	require.Equal(t, "SCION", mapped.Details[0].ConnType)
+	require.Equal(t, "via 11.12.13.14", mapped.Details[0].ScionPath)
+
+	overview := OutputOverview{ScionState: ScionStateOutput{LocalIA: "1-ff00:0:110", LocalAddress: "1-ff00:0:110,[11.12.13.14]:30041", LastError: "failed in 1-ff00:0:110 via 11.12.13.14", RefreshHealth: "path 11.12.13.14 unhealthy"}, Peers: mapped}
+	anonymizeOverview(anonymize.NewAnonymizer(netip.MustParseAddr("198.51.100.1"), netip.MustParseAddr("2001:db8:ffff::1")), &overview)
+	blob, err := overview.JSON()
+	require.NoError(t, err)
+	require.False(t, strings.Contains(blob, "11.12.13.14"), blob)
+	require.False(t, strings.Contains(blob, "1-ff00:0:110"), blob)
+	yamlBlob, err := overview.YAML()
+	require.NoError(t, err)
+	require.NotContains(t, yamlBlob, "1-ff00:0:110")
+	require.NotContains(t, overview.FullDetailSummary(), "1-ff00:0:110")
+}
+
 func TestConversionFromFullStatusToOutputOverview(t *testing.T) {
 	convertedResult := ConvertToStatusOutputOverview(resp.GetFullStatus(), ConvertOptions{
 		DaemonVersion: resp.GetDaemonVersion(),
@@ -407,7 +447,8 @@ func TestParsingToJSON(t *testing.T) {
 		  "sshServer":{
 		    "enabled":false,
 			"sessions":[]
-		  }
+		  },
+		  "scion":{"supported":false,"enabled":false,"active":false,"connectedPeers":0}
         }`
 	// @formatter:on
 
@@ -517,6 +558,11 @@ profileName: ""
 sshServer:
     enabled: false
     sessions: []
+scion:
+    supported: false
+    enabled: false
+    active: false
+    connectedPeers: 0
 `
 
 	assert.Equal(t, expectedYAML, yaml)

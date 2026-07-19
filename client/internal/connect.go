@@ -602,6 +602,7 @@ func createEngineConfig(key wgtypes.Key, config *profilemanager.Config, peerConf
 		NATExternalIPs:                config.NATExternalIPs,
 		CustomDNSAddress:              config.CustomDNSAddress,
 		RosenpassEnabled:              config.RosenpassEnabled,
+		ScionEnabled:                  config.ScionEnabled,
 		RosenpassPermissive:           config.RosenpassPermissive,
 		ServerSSHAllowed:              util.ReturnBoolWithDefaultTrue(config.ServerSSHAllowed),
 		EnableSSHRoot:                 config.EnableSSHRoot,

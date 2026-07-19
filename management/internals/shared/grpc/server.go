@@ -47,6 +47,7 @@ import (
 	"github.com/netbirdio/netbird/management/server/types"
 	"github.com/netbirdio/netbird/shared/management/proto"
 	internalStatus "github.com/netbirdio/netbird/shared/management/status"
+	"github.com/netbirdio/netbird/shared/scionaddr"
 )
 
 const (
@@ -643,6 +644,15 @@ func extractPeerMeta(ctx context.Context, meta *proto.PeerSystemMeta) nbpeer.Pee
 		})
 	}
 
+	scionAddress := ""
+	if value := meta.GetScionAddress(); value != "" {
+		if parsed, err := scionaddr.Parse(value); err == nil && parsed.String() == value {
+			scionAddress = value
+		} else {
+			log.WithContext(ctx).Warnf("ignoring invalid SCION address %q", value)
+		}
+	}
+
 	files := make([]nbpeer.File, 0, len(meta.GetFiles()))
 	for _, file := range meta.GetFiles() {
 		files = append(files, nbpeer.File{
@@ -685,6 +695,7 @@ func extractPeerMeta(ctx context.Context, meta *proto.PeerSystemMeta) nbpeer.Pee
 		},
 		Files:        files,
 		Capabilities: capabilitiesToInt32(meta.GetCapabilities()),
+		ScionAddress: scionAddress,
 	}
 }
 

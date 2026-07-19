@@ -647,6 +647,7 @@ func (g *BundleGenerator) addCommonConfigFields(configContent *strings.Builder) 
 	configContent.WriteString(fmt.Sprintf("DisableIPv6Discovery: %v\n", g.internalConfig.DisableIPv6Discovery))
 	configContent.WriteString(fmt.Sprintf("RosenpassEnabled: %v\n", g.internalConfig.RosenpassEnabled))
 	configContent.WriteString(fmt.Sprintf("RosenpassPermissive: %v\n", g.internalConfig.RosenpassPermissive))
+	configContent.WriteString(fmt.Sprintf("ScionEnabled: %v\n", g.internalConfig.ScionEnabled))
 	if g.internalConfig.ServerSSHAllowed != nil {
 		configContent.WriteString(fmt.Sprintf("ServerSSHAllowed: %v\n", *g.internalConfig.ServerSSHAllowed))
 	}

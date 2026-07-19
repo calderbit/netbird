@@ -595,6 +595,7 @@ func TestSqlStore_SavePeer(t *testing.T) {
 	updatedPeer := peer.Copy()
 	updatedPeer.Status.Connected = false
 	updatedPeer.Meta.Hostname = "updatedpeer"
+	updatedPeer.Meta.ScionAddress = "1-ff00:0:110,[192.0.2.1]:30041"
 
 	err = store.SavePeer(ctx, account.Id, updatedPeer)
 	require.NoError(t, err)

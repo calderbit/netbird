@@ -61,8 +61,8 @@ func NewProxyBind(bind Bind, mtu uint16) *ProxyBind {
 //   - ctx: Context is used for proxyToLocal to avoid unnecessary error messages
 //   - nbAddr: The NetBird UDP address of the remote peer, it required to generate fake address
 //   - remoteConn: The established TURN connection to the remote peer
-func (p *ProxyBind) AddTurnConn(ctx context.Context, nbAddr *net.UDPAddr, remoteConn net.Conn) error {
-	fakeNetIP, err := fakeAddress(nbAddr)
+func (p *ProxyBind) AddTurnConn(ctx context.Context, nbAddr *net.UDPAddr, remoteConn net.Conn, fakePrefix byte) error {
+	fakeNetIP, err := fakeAddress(nbAddr, fakePrefix)
 	if err != nil {
 		return err
 	}
@@ -202,9 +202,12 @@ func (p *ProxyBind) proxyToLocal(ctx context.Context) {
 }
 
 // fakeAddress returns a fake address that is used as an identifier for the peer.
-// The fake address is in the format of 127.1.x.x where x.x is derived from the
-// last two bytes of the peer address (works for both IPv4 and IPv6).
-func fakeAddress(peerAddress *net.UDPAddr) (*netip.AddrPort, error) {
+// The fake address is 127.<prefix>.x.x, where x.x is derived from the last two
+// bytes of the peer address (works for both IPv4 and IPv6).
+func fakeAddress(peerAddress *net.UDPAddr, fakePrefix byte) (*netip.AddrPort, error) {
+	if fakePrefix == 0 || fakePrefix == 255 {
+		return nil, fmt.Errorf("invalid fake address prefix: %d", fakePrefix)
+	}
 	if peerAddress == nil {
 		return nil, fmt.Errorf("nil peer address")
 	}
@@ -219,7 +222,7 @@ func fakeAddress(peerAddress *net.UDPAddr) (*netip.AddrPort, error) {
 	addr = addr.Unmap()
 
 	raw := addr.As16()
-	fakeIP := netip.AddrFrom4([4]byte{127, 1, raw[14], raw[15]})
+	fakeIP := netip.AddrFrom4([4]byte{127, fakePrefix, raw[14], raw[15]})
 
 	netipAddr := netip.AddrPortFrom(fakeIP, uint16(peerAddress.Port))
 	return &netipAddr, nil

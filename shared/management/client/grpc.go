@@ -1026,6 +1026,7 @@ func infoToMetaData(info *system.Info) *proto.PeerSystemMeta {
 		},
 
 		Capabilities: peerCapabilities(*info),
+		ScionAddress: info.ScionAddress,
 	}
 }
 
@@ -1036,6 +1037,9 @@ func peerCapabilities(info system.Info) []proto.PeerCapability {
 	}
 	if !info.DisableIPv6 {
 		caps = append(caps, proto.PeerCapability_PeerCapabilityIPv6Overlay)
+	}
+	if info.ScionSupported || system.ScionSupported() {
+		caps = append(caps, proto.PeerCapability_PeerCapabilityScion)
 	}
 	return caps
 }

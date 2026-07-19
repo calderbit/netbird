@@ -121,7 +121,7 @@ func NewProxyWrapper(proxy *WGEBPFProxy) *ProxyWrapper {
 	}
 }
 
-func (p *ProxyWrapper) AddTurnConn(ctx context.Context, _ *net.UDPAddr, remoteConn net.Conn) error {
+func (p *ProxyWrapper) AddTurnConn(ctx context.Context, _ *net.UDPAddr, remoteConn net.Conn, _ byte) error {
 	addr, err := p.wgeBPFProxy.AddTurnConn(remoteConn)
 	if err != nil {
 		return fmt.Errorf("add turn conn: %w", err)

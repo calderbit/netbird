@@ -12,6 +12,19 @@ import (
 	mgmtProto "github.com/netbirdio/netbird/shared/management/proto"
 )
 
+func TestExtractPeerMetaSCIONAddress(t *testing.T) {
+	ctx := context.Background()
+	canonical := "1-ff00:0:110,[192.0.2.1]:30042"
+	if got := extractPeerMeta(ctx, &mgmtProto.PeerSystemMeta{ScionAddress: canonical}).ScionAddress; got != canonical {
+		t.Fatalf("canonical address = %q", got)
+	}
+	for _, invalid := range []string{"1-FF00:0:110,[192.0.2.1]:30042", "not-an-address"} {
+		if got := extractPeerMeta(ctx, &mgmtProto.PeerSystemMeta{ScionAddress: invalid}).ScionAddress; got != "" {
+			t.Errorf("invalid address %q accepted as %q", invalid, got)
+		}
+	}
+}
+
 func TestServer_GetDeviceAuthorizationFlow(t *testing.T) {
 	testingServerKey, err := wgtypes.GeneratePrivateKey()
 	if err != nil {

@@ -24,6 +24,9 @@ type connStatusInputs struct {
 	iceWorkerCreated    bool // local WorkerICE exists (false in force-relay mode)
 	iceStatusConnecting bool // statusICE is anything other than Disconnected
 	iceInProgress       bool // a negotiation is currently in flight
+	scionWorkerCreated  bool // local WorkerSCION exists
+	scionConnected      bool // statusSCION reports Connected
+	scionInProgress     bool // discovery/probing is active and not all-unhealthy
 }
 
 // ConnStatus describe the status of a peer's connection

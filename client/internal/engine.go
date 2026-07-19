@@ -54,6 +54,7 @@ import (
 	"github.com/netbirdio/netbird/client/internal/relay"
 	"github.com/netbirdio/netbird/client/internal/rosenpass"
 	"github.com/netbirdio/netbird/client/internal/routemanager"
+	"github.com/netbirdio/netbird/client/internal/scion"
 	"github.com/netbirdio/netbird/client/internal/statemanager"
 	"github.com/netbirdio/netbird/client/internal/syncstore"
 	"github.com/netbirdio/netbird/client/internal/updater"
@@ -68,6 +69,7 @@ import (
 	"github.com/netbirdio/netbird/shared/netiputil"
 	auth "github.com/netbirdio/netbird/shared/relay/auth/hmac"
 	relayClient "github.com/netbirdio/netbird/shared/relay/client"
+	"github.com/netbirdio/netbird/shared/scionaddr"
 	signal "github.com/netbirdio/netbird/shared/signal/client"
 	sProto "github.com/netbirdio/netbird/shared/signal/proto"
 	"github.com/netbirdio/netbird/util"
@@ -129,6 +131,7 @@ type EngineConfig struct {
 	CustomDNSAddress string
 
 	RosenpassEnabled    bool
+	ScionEnabled        bool
 	RosenpassPermissive bool
 
 	ServerSSHAllowed              bool
@@ -191,7 +194,13 @@ type Engine struct {
 	connMgr *ConnMgr
 
 	// rpManager is a Rosenpass manager
-	rpManager *rosenpass.Manager
+	rpManager         *rosenpass.Manager
+	scionManager      *scion.Manager
+	scionMetaMu       sync.Mutex
+	scionMetaRevision uint64
+	scionMetaAddress  string
+	scionMetaChanged  chan struct{}
+	lastScionAddress  string
 
 	// syncMsgMux is used to guarantee sequential Management Service message processing
 	syncMsgMux *sync.Mutex
@@ -323,6 +332,7 @@ func NewEngine(
 		relayManager:       services.RelayManager,
 		peerStore:          peerstore.NewConnStore(),
 		syncMsgMux:         &sync.Mutex{},
+		scionMetaChanged:   make(chan struct{}, 1),
 		config:             config,
 		mobileDep:          mobileDep,
 		STUNs:              []*stun.URI{},
@@ -391,6 +401,12 @@ func (e *Engine) Stop() error {
 func (e *Engine) stopLocked() {
 	if e.connMgr != nil {
 		e.connMgr.Close()
+	}
+	if e.scionManager != nil {
+		if err := e.scionManager.Close(); err != nil {
+			log.Warnf("close SCION manager: %v", err)
+		}
+		e.scionManager = nil
 	}
 
 	// stopping network monitor first to avoid starting the engine again
@@ -628,6 +644,15 @@ func (e *Engine) Start(netbirdConfig *mgmProto.NetbirdConfig, mgmtURL *url.URL) 
 	// conntrack entries from being created before the rules are in place
 	e.setupWGProxyNoTrack()
 
+	scionConfig := scion.ResolveConfig(e.config.ScionEnabled, e.config.StateDir)
+	scionConfig.InterfaceMTU = e.config.MTU
+	scionConfig.OnAddressChange = e.queueSCIONMeta
+	scionConfig.OnStatusChange = e.statusRecorder.UpdateSCIONState
+	e.shutdownWg.Add(1)
+	go e.runSCIONMetaWorker()
+	e.scionManager, _ = scion.NewManager(e.ctx, scionConfig)
+	e.statusRecorder.UpdateSCIONState(e.scionManager.Status())
+
 	// Start after interface is up since port may have been resolved from 0 or changed if occupied
 	e.shutdownWg.Add(1)
 	go func() {
@@ -656,6 +681,21 @@ func (e *Engine) Start(netbirdConfig *mgmProto.NetbirdConfig, mgmtURL *url.URL) 
 
 	e.srWatcher = guard.NewSRWatcher(e.signal, e.relayManager, e.mobileDep.IFaceDiscover, iceCfg)
 	e.srWatcher.Start(peer.IsForceRelayed())
+	if e.scionManager != nil {
+		manager := e.scionManager
+		listener := e.srWatcher.NewListener()
+		go func() {
+			defer e.srWatcher.RemoveListener(listener)
+			for {
+				select {
+				case <-listener:
+					manager.Kick()
+				case <-e.ctx.Done():
+					return
+				}
+			}
+		}()
+	}
 
 	if err = e.receiveSignalEvents(); err != nil {
 		return err
@@ -814,7 +854,7 @@ func (e *Engine) modifyPeers(peersUpdate []*mgmProto.RemotePeerConfig) error {
 			continue
 		}
 
-		if currentPeer.AgentVersionString() != p.AgentVersion {
+		if peerRequiresRebuild(currentPeer.AgentVersionString(), currentPeer.SCIONAddressString(), p) {
 			modified = append(modified, p)
 			continue
 		}
@@ -1151,8 +1191,97 @@ func (e *Engine) updateChecksIfNew(checks []*mgmProto.Checks) error {
 	return nil
 }
 
+func (e *Engine) queueSCIONMeta(address string) {
+	e.scionMetaMu.Lock()
+	e.scionMetaRevision++
+	e.scionMetaAddress = address
+	e.scionMetaMu.Unlock()
+	select {
+	case e.scionMetaChanged <- struct{}{}:
+	default:
+	}
+}
+
+func (e *Engine) runSCIONMetaWorker() {
+	defer e.shutdownWg.Done()
+	for {
+		select {
+		case <-e.scionMetaChanged:
+			e.syncSCIONMeta()
+		case <-e.ctx.Done():
+			return
+		}
+	}
+}
+
+func (e *Engine) syncSCIONMeta() {
+	backoff := time.Second
+	for {
+		e.scionMetaMu.Lock()
+		address, revision, lastAddress := e.scionMetaAddress, e.scionMetaRevision, e.lastScionAddress
+		e.scionMetaMu.Unlock()
+		if address == lastAddress {
+			return
+		}
+
+		e.syncMsgMux.Lock()
+		checks := append([]*mgmProto.Checks(nil), e.checks...)
+		manager := e.scionManager
+		e.syncMsgMux.Unlock()
+		info, ok := system.GetInfoWithChecksTimeout(e.ctx, systemInfoTimeout, checks, e.overlayAddresses()...)
+		if ok {
+			e.applyInfoFlagsWithSCIONManager(info, manager)
+			info.ScionAddress = address
+			e.scionMetaMu.Lock()
+			current := revision == e.scionMetaRevision
+			e.scionMetaMu.Unlock()
+			if !current {
+				backoff = time.Second
+				continue
+			}
+			if err := e.mgmClient.SyncMeta(info); err == nil {
+				e.scionMetaMu.Lock()
+				if revision == e.scionMetaRevision {
+					e.lastScionAddress = address
+				}
+				current = revision == e.scionMetaRevision
+				e.scionMetaMu.Unlock()
+				if current {
+					return
+				}
+				continue
+			} else {
+				log.Debugf("sync SCION metadata: %v", err)
+			}
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-timer.C:
+			backoff = min(30*time.Second, backoff*2)
+		case <-e.scionMetaChanged:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			backoff = time.Second
+		case <-e.ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return
+		}
+	}
+}
+
 // applyInfoFlags sets the engine's config-derived feature flags on the gathered system info.
 func (e *Engine) applyInfoFlags(info *system.Info) {
+	e.applyInfoFlagsWithSCIONManager(info, e.scionManager)
+}
+
+func (e *Engine) applyInfoFlagsWithSCIONManager(info *system.Info, manager *scion.Manager) {
+	info.ScionSupported = scion.Supported()
+	if manager != nil {
+		info.ScionAddress = manager.LocalAddress()
+	}
 	info.SetFlags(
 		e.config.RosenpassEnabled,
 		e.config.RosenpassPermissive,
@@ -1329,13 +1458,17 @@ func (e *Engine) receiveManagementEvents() {
 	e.shutdownWg.Add(1)
 	go func() {
 		defer e.shutdownWg.Done()
-		info, ok := system.GetInfoWithChecksTimeout(e.ctx, systemInfoTimeout, e.checks, e.overlayAddresses()...)
+		e.syncMsgMux.Lock()
+		checks := append([]*mgmProto.Checks(nil), e.checks...)
+		manager := e.scionManager
+		e.syncMsgMux.Unlock()
+		info, ok := system.GetInfoWithChecksTimeout(e.ctx, systemInfoTimeout, checks, e.overlayAddresses()...)
 		if !ok {
 			// Gathering timed out; connect the stream with base info so management
 			// connectivity still comes up rather than blocking here.
 			info = system.GetInfo(e.ctx)
 		}
-		e.applyInfoFlags(info)
+		e.applyInfoFlagsWithSCIONManager(info, manager)
 
 		err := e.mgmClient.Sync(e.ctx, info, e.handleSync)
 		if err != nil {
@@ -1724,6 +1857,21 @@ func overlayAddrsFromAllowedIPs(allowedIPs []string, ourV6Net netip.Prefix) (v4,
 	return
 }
 
+func peerRequiresRebuild(agentVersion, scionAddress string, update *mgmProto.RemotePeerConfig) bool {
+	return agentVersion != update.GetAgentVersion() || scionAddress != canonicalSCIONAddress(update.GetScionAddress())
+}
+
+func canonicalSCIONAddress(value string) string {
+	if value == "" {
+		return ""
+	}
+	parsed, err := scionaddr.Parse(value)
+	if err != nil || parsed.String() != value {
+		return ""
+	}
+	return value
+}
+
 func addrToString(addr netip.Addr) string {
 	if !addr.IsValid() {
 		return ""
@@ -1766,7 +1914,7 @@ func (e *Engine) addNewPeer(peerConfig *mgmProto.RemotePeerConfig) error {
 		return fmt.Errorf("peer %s has no usable AllowedIPs", peerKey)
 	}
 
-	conn, err := e.createPeerConn(peerKey, peerIPs, peerConfig.AgentVersion)
+	conn, err := e.createPeerConn(peerKey, peerIPs, peerConfig.AgentVersion, peerConfig.GetScionAddress())
 	if err != nil {
 		return fmt.Errorf("create peer connection: %w", err)
 	}
@@ -1785,7 +1933,7 @@ func (e *Engine) addNewPeer(peerConfig *mgmProto.RemotePeerConfig) error {
 	return nil
 }
 
-func (e *Engine) createPeerConn(pubKey string, allowedIPs []netip.Prefix, agentVersion string) (*peer.Conn, error) {
+func (e *Engine) createPeerConn(pubKey string, allowedIPs []netip.Prefix, agentVersion, scionAddress string) (*peer.Conn, error) {
 	log.Debugf("creating peer connection %s", pubKey)
 
 	wgConfig := peer.WgConfig{
@@ -1796,12 +1944,23 @@ func (e *Engine) createPeerConn(pubKey string, allowedIPs []netip.Prefix, agentV
 		PreSharedKey: e.config.PreSharedKey,
 	}
 
+	var remoteSCION scionaddr.Address
+	if scionAddress != "" {
+		parsed, err := scionaddr.Parse(scionAddress)
+		if err != nil || parsed.String() != scionAddress {
+			log.Warnf("ignoring invalid SCION address for peer %s", pubKey)
+		} else {
+			remoteSCION = parsed
+		}
+	}
+
 	// randomize connection timeout
 	timeout := time.Duration(rand.Intn(PeerConnectionTimeoutMax-PeerConnectionTimeoutMin)+PeerConnectionTimeoutMin) * time.Millisecond
 	config := peer.ConnConfig{
 		Key:          pubKey,
 		LocalKey:     e.config.WgPrivateKey.PublicKey().String(),
 		AgentVersion: agentVersion,
+		SCIONAddress: remoteSCION,
 		Timeout:      timeout,
 		WgConfig:     wgConfig,
 		LocalWgPort:  e.config.WgPort,
@@ -1821,6 +1980,7 @@ func (e *Engine) createPeerConn(pubKey string, allowedIPs []netip.Prefix, agentV
 		SrWatcher:          e.srWatcher,
 		PortForwardManager: e.portForwardManager,
 		MetricsRecorder:    e.clientMetrics,
+		SCIONManager:       e.scionManager,
 	}
 	peerConn, err := peer.NewConn(config, serviceDependencies)
 	if err != nil {

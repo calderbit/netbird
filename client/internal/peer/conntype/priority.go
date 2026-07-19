@@ -5,10 +5,12 @@ import (
 )
 
 const (
-	None    ConnPriority = 0
-	Relay   ConnPriority = 1
-	ICETurn ConnPriority = 2
-	ICEP2P  ConnPriority = 3
+	None           ConnPriority = 0
+	Relay          ConnPriority = 1
+	ICETurn        ConnPriority = 2
+	SCION          ConnPriority = 3
+	ICEP2P         ConnPriority = 4
+	SCIONPreferred ConnPriority = 5
 )
 
 type ConnPriority int
@@ -21,6 +23,8 @@ func (cp ConnPriority) String() string {
 		return "PriorityRelay"
 	case ICETurn:
 		return "PriorityICETurn"
+	case SCION, SCIONPreferred:
+		return "PrioritySCION"
 	case ICEP2P:
 		return "PriorityICEP2P"
 	default:

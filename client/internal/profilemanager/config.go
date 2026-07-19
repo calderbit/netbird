@@ -79,6 +79,7 @@ type ConfigInput struct {
 	NATExternalIPs                []string
 	CustomDNSAddress              []byte
 	RosenpassEnabled              *bool
+	ScionEnabled                  *bool
 	RosenpassPermissive           *bool
 	InterfaceName                 *string
 	WireguardPort                 *int
@@ -121,6 +122,7 @@ type Config struct {
 	IFaceBlackList                []string
 	DisableIPv6Discovery          bool
 	RosenpassEnabled              bool
+	ScionEnabled                  bool
 	RosenpassPermissive           bool
 	ServerSSHAllowed              *bool
 	EnableSSHRoot                 *bool
@@ -377,6 +379,12 @@ func (config *Config) apply(input ConfigInput) (updated bool, err error) {
 	if input.RosenpassEnabled != nil && *input.RosenpassEnabled != config.RosenpassEnabled {
 		log.Infof("switching Rosenpass to %t", *input.RosenpassEnabled)
 		config.RosenpassEnabled = *input.RosenpassEnabled
+		updated = true
+	}
+
+	if input.ScionEnabled != nil && *input.ScionEnabled != config.ScionEnabled {
+		log.Infof("switching SCION to %t", *input.ScionEnabled)
+		config.ScionEnabled = *input.ScionEnabled
 		updated = true
 	}
 

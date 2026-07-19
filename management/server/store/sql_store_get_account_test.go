@@ -52,6 +52,37 @@ func TestPostgresql_GetAccount_LoadsCustomDomains(t *testing.T) {
 	assertGetAccountLoadsCustomDomains(t, store)
 }
 
+func TestPostgresql_GetAccount_PreservesPeerSCIONAddress(t *testing.T) {
+	if (os.Getenv("CI") == "true" && runtime.GOOS == "darwin") || runtime.GOOS == "windows" {
+		t.Skip("skip CI tests on darwin and windows")
+	}
+
+	t.Setenv("NETBIRD_STORE_ENGINE", string(types.PostgresStoreEngine))
+	store, cleanup, err := NewTestStoreFromSQL(context.Background(), "", t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(cleanup)
+
+	const (
+		accountID    = "acct-scion-address"
+		peerID       = "peer-scion"
+		scionAddress = "1-ff00:0:110,[192.0.2.1]:30041"
+	)
+	ctx := context.Background()
+	account := newAccountWithId(ctx, accountID, "user-scion", "")
+	account.Peers[peerID] = &nbpeer.Peer{
+		Key:    "peer-scion-key",
+		IP:     netip.MustParseAddr("100.64.0.1"),
+		Meta:   nbpeer.PeerSystemMeta{ScionAddress: scionAddress},
+		Status: &nbpeer.PeerStatus{},
+	}
+	require.NoError(t, store.SaveAccount(ctx, account))
+
+	reloaded, err := store.GetAccount(ctx, accountID)
+	require.NoError(t, err)
+	require.Contains(t, reloaded.Peers, peerID)
+	assert.Equal(t, scionAddress, reloaded.Peers[peerID].Meta.ScionAddress)
+}
+
 // assertGetAccountLoadsCustomDomains exercises both the gorm and pgx GetAccount
 // paths: it persists two custom domains and asserts the relation comes back
 // populated, which SynthesizePrivateServiceZones relies on.

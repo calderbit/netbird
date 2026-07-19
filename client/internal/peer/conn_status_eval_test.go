@@ -199,3 +199,39 @@ func TestEvalConnStatus_FullyAvailable(t *testing.T) {
 		})
 	}
 }
+
+func TestEvalConnStatus_SCION(t *testing.T) {
+	tests := []struct {
+		name string
+		in   connStatusInputs
+		want guard.ConnStatus
+	}{
+		{
+			name: "SCION-only healthy",
+			in:   connStatusInputs{scionWorkerCreated: true, scionConnected: true},
+			want: guard.ConnStatusConnected,
+		},
+		{
+			name: "SCION discovery in progress",
+			in:   connStatusInputs{scionWorkerCreated: true, scionInProgress: true},
+			want: guard.ConnStatusConnected,
+		},
+		{
+			name: "SCION failed with relay fallback",
+			in:   connStatusInputs{peerUsesRelay: true, relayConnected: true, scionWorkerCreated: true},
+			want: guard.ConnStatusPartiallyConnected,
+		},
+		{
+			name: "SCION failed without fallback",
+			in:   connStatusInputs{scionWorkerCreated: true},
+			want: guard.ConnStatusDisconnected,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := evalConnStatus(tc.in); got != tc.want {
+				t.Fatalf("evalConnStatus = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

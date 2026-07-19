@@ -16,12 +16,14 @@ import (
 const anonTLD = ".domain"
 
 type Anonymizer struct {
-	ipAnonymizer     map[netip.Addr]netip.Addr
-	domainAnonymizer map[string]string
-	currentAnonIPv4  netip.Addr
-	currentAnonIPv6  netip.Addr
-	startAnonIPv4    netip.Addr
-	startAnonIPv6    netip.Addr
+	ipAnonymizer       map[netip.Addr]netip.Addr
+	domainAnonymizer   map[string]string
+	scionIAAnonymizer  map[string]string
+	currentAnonSCIONIA uint64
+	currentAnonIPv4    netip.Addr
+	currentAnonIPv6    netip.Addr
+	startAnonIPv4      netip.Addr
+	startAnonIPv6      netip.Addr
 
 	domainKeyRegex *regexp.Regexp
 }
@@ -34,15 +36,30 @@ func DefaultAddresses() (netip.Addr, netip.Addr) {
 
 func NewAnonymizer(startIPv4, startIPv6 netip.Addr) *Anonymizer {
 	return &Anonymizer{
-		ipAnonymizer:     map[netip.Addr]netip.Addr{},
-		domainAnonymizer: map[string]string{},
-		currentAnonIPv4:  startIPv4,
-		currentAnonIPv6:  startIPv6,
-		startAnonIPv4:    startIPv4,
-		startAnonIPv6:    startIPv6,
+		ipAnonymizer:       map[netip.Addr]netip.Addr{},
+		domainAnonymizer:   map[string]string{},
+		scionIAAnonymizer:  map[string]string{},
+		currentAnonSCIONIA: 1,
+		currentAnonIPv4:    startIPv4,
+		currentAnonIPv6:    startIPv6,
+		startAnonIPv4:      startIPv4,
+		startAnonIPv6:      startIPv6,
 
 		domainKeyRegex: regexp.MustCompile(`\bdomain=([^\s,:"]+)`),
 	}
+}
+
+func (a *Anonymizer) AnonymizeSCIONIA(ia string) string {
+	if ia == "" {
+		return ""
+	}
+	if anonymized, ok := a.scionIAAnonymizer[ia]; ok {
+		return anonymized
+	}
+	anonymized := fmt.Sprintf("1-ff00:0:%x", a.currentAnonSCIONIA)
+	a.currentAnonSCIONIA++
+	a.scionIAAnonymizer[ia] = anonymized
+	return anonymized
 }
 
 func (a *Anonymizer) AnonymizeIP(ip netip.Addr) netip.Addr {

@@ -74,6 +74,9 @@ type Info struct {
 	BlockInbound        bool
 	DisableIPv6         bool
 
+	ScionSupported bool
+	ScionAddress   string
+
 	EnableSSHRoot                 bool
 	EnableSSHSFTP                 bool
 	EnableSSHLocalPortForwarding  bool

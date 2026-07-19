@@ -22,6 +22,7 @@ import (
 	"github.com/netbirdio/netbird/client/iface/configurer"
 	"github.com/netbirdio/netbird/client/internal/ingressgw"
 	"github.com/netbirdio/netbird/client/internal/relay"
+	"github.com/netbirdio/netbird/client/internal/scion"
 	"github.com/netbirdio/netbird/client/proto"
 	"github.com/netbirdio/netbird/route"
 	"github.com/netbirdio/netbird/shared/management/domain"
@@ -71,6 +72,10 @@ type State struct {
 	Latency                    time.Duration
 	RosenpassEnabled           bool
 	SSHHostKey                 []byte
+	ScionActive                bool
+	ScionPath                  string
+	ScionLatency               time.Duration
+	ScionPathCount             int
 	routes                     map[string]struct{}
 }
 
@@ -164,6 +169,7 @@ type FullStatus struct {
 	NumOfForwardingRules  int
 	LazyConnectionEnabled bool
 	Events                []*proto.SystemEvent
+	ScionState            scion.State
 }
 
 type StatusChangeSubscription struct {
@@ -250,6 +256,7 @@ type Status struct {
 
 	routeIDLookup routeIDLookup
 	wgIface       WGIfaceStatus
+	scionState    scion.State
 }
 
 // NewRecorder returns a new Status instance
@@ -385,6 +392,87 @@ func (d *Status) RemovePeer(peerPubKey string) error {
 	return nil
 }
 
+func (d *Status) UpdatePeerSCIONState(peerKey string, state scion.PeerState, active bool) error {
+	d.mux.Lock()
+	peerState, ok := d.peers[peerKey]
+	if !ok {
+		d.mux.Unlock()
+		return errors.New("peer doesn't exist")
+	}
+	updated := active && !state.AllUnhealthy
+	changed := peerState.ScionActive != updated || peerState.ScionPath != state.Path || peerState.ScionLatency != state.Latency || peerState.ScionPathCount != state.PathCount
+	peerState.ScionActive = updated
+	peerState.ScionPath = state.Path
+	peerState.ScionLatency = state.Latency
+	peerState.ScionPathCount = state.PathCount
+	d.peers[peerKey] = peerState
+	d.mux.Unlock()
+	if changed {
+		d.notifyStateChange()
+	}
+	return nil
+}
+
+func (d *Status) SetPeerSCIONActive(peerKey string, active bool) {
+	d.mux.Lock()
+	peerState, ok := d.peers[peerKey]
+	changed := ok && peerState.ScionActive != active
+	if changed {
+		peerState.ScionActive = active
+		d.peers[peerKey] = peerState
+	}
+	d.mux.Unlock()
+	if changed {
+		d.notifyStateChange()
+	}
+}
+
+// UpdatePeerSCIONTransport atomically publishes the authoritative transport and
+// base connectivity state so router and peer-list consumers cannot observe a
+// half-applied SCION transition.
+func (d *Status) UpdatePeerSCIONTransport(peerKey string, active bool, status ConnStatus, relayed bool) error {
+	d.mux.Lock()
+	peerState, ok := d.peers[peerKey]
+	if !ok {
+		d.mux.Unlock()
+		return errors.New("peer doesn't exist")
+	}
+	oldStatus, oldRelayed := peerState.ConnStatus, peerState.Relayed
+	changed := peerState.ScionActive != active || oldStatus != status || oldRelayed != relayed
+	peerState.ScionActive = active
+	peerState.ConnStatus = status
+	peerState.Relayed = relayed
+	if oldStatus != status {
+		peerState.ConnStatusUpdate = time.Now()
+	}
+	d.peers[peerKey] = peerState
+	notifyList := hasConnStatusChanged(oldStatus, status)
+	notifyRouter := hasStatusOrRelayedChange(oldStatus, status, oldRelayed, relayed)
+	routerSnapshot := d.snapshotRouterPeersLocked(peerKey, notifyRouter)
+	numPeers := d.numOfPeers()
+	d.mux.Unlock()
+	if notifyList {
+		d.notifier.peerListChanged(numPeers)
+	}
+	if notifyRouter {
+		d.dispatchRouterPeers(peerKey, routerSnapshot)
+	}
+	if changed {
+		d.notifyStateChange()
+	}
+	return nil
+}
+
+func (d *Status) UpdateSCIONState(state scion.State) {
+	d.mux.Lock()
+	changed := d.scionState != state
+	d.scionState = state
+	d.mux.Unlock()
+	if changed {
+		d.notifyStateChange()
+	}
+}
+
 // UpdatePeerState updates peer status
 func (d *Status) UpdatePeerState(receivedState State) error {
 	d.mux.Lock()
@@ -502,10 +590,14 @@ func (d *Status) UpdatePeerICEState(receivedState State) error {
 
 	oldState := peerState.ConnStatus
 	oldIsRelayed := peerState.Relayed
+	relayed := receivedState.Relayed
+	if peerState.ScionActive {
+		relayed = peerState.Relayed
+	}
 
 	peerState.ConnStatus = receivedState.ConnStatus
 	peerState.ConnStatusUpdate = receivedState.ConnStatusUpdate
-	peerState.Relayed = receivedState.Relayed
+	peerState.Relayed = relayed
 	peerState.LocalIceCandidateType = receivedState.LocalIceCandidateType
 	peerState.RemoteIceCandidateType = receivedState.RemoteIceCandidateType
 	peerState.LocalIceCandidateEndpoint = receivedState.LocalIceCandidateEndpoint
@@ -515,7 +607,7 @@ func (d *Status) UpdatePeerICEState(receivedState State) error {
 	d.peers[receivedState.PubKey] = peerState
 
 	notifyList := hasConnStatusChanged(oldState, receivedState.ConnStatus)
-	notifyRouter := hasStatusOrRelayedChange(oldState, receivedState.ConnStatus, oldIsRelayed, receivedState.Relayed)
+	notifyRouter := hasStatusOrRelayedChange(oldState, receivedState.ConnStatus, oldIsRelayed, relayed)
 	routerSnapshot := d.snapshotRouterPeersLocked(receivedState.PubKey, notifyRouter)
 	numPeers := d.numOfPeers()
 
@@ -1187,6 +1279,7 @@ func (d *Status) GetFullStatus() FullStatus {
 	d.mux.RLock()
 	defer d.mux.RUnlock()
 
+	fullStatus.ScionState = d.scionState
 	fullStatus.LocalPeerState = d.localPeer
 
 	for _, status := range d.peers {
@@ -1517,6 +1610,10 @@ func (s *EventSubscription) Events() <-chan *proto.SystemEvent {
 	return s.events
 }
 
+func scionStateToProto(state scion.State) *proto.ScionState {
+	return &proto.ScionState{Supported: state.Supported, Enabled: state.Enabled, Active: state.Active, LocalIA: state.LocalIA, LocalAddress: state.LocalAddress, ConnectedPeers: int32(state.ConnectedPeers), LastError: state.LastError, RefreshHealth: state.RefreshHealth}
+}
+
 // ToProto converts FullStatus to proto.FullStatus.
 func (fs FullStatus) ToProto() *proto.FullStatus {
 	pbFullStatus := proto.FullStatus{
@@ -1524,6 +1621,7 @@ func (fs FullStatus) ToProto() *proto.FullStatus {
 		SignalState:     &proto.SignalState{},
 		LocalPeerState:  &proto.LocalPeerState{},
 		Peers:           []*proto.PeerState{},
+		ScionState:      scionStateToProto(fs.ScionState),
 	}
 
 	pbFullStatus.ManagementState.URL = fs.ManagementState.URL
@@ -1574,6 +1672,10 @@ func (fs FullStatus) ToProto() *proto.FullStatus {
 			Networks:                   networks,
 			Latency:                    durationpb.New(peerState.Latency),
 			SshHostKey:                 peerState.SSHHostKey,
+			ScionActive:                peerState.ScionActive,
+			ScionPath:                  peerState.ScionPath,
+			ScionLatency:               durationpb.New(peerState.ScionLatency),
+			ScionPathCount:             int32(peerState.ScionPathCount),
 		}
 		pbFullStatus.Peers = append(pbFullStatus.Peers, pbPeerState)
 	}

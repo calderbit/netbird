@@ -391,6 +391,10 @@ message PeerState {
   string relayAddress = 18;
   bytes sshHostKey = 19;
   string ipv6 = 20;
+  bool scionActive = 21;
+  string scionPath = 22;
+  google.protobuf.Duration scionLatency = 23;
+  int32 scionPathCount = 24;
 }
 
 // LocalPeerState contains the latest state of the local peer
@@ -452,6 +456,17 @@ message SSHServerState {
   repeated SSHSessionInfo sessions = 2;
 }
 
+message ScionState {
+  bool supported = 1;
+  bool enabled = 2;
+  bool active = 3;
+  string localIA = 4;
+  string localAddress = 5;
+  int32 connectedPeers = 6;
+  string lastError = 7;
+  string refreshHealth = 8;
+}
+
 // FullStatus contains the full state held by the Status instance
 message FullStatus {
   ManagementState managementState = 1;
@@ -472,6 +487,7 @@ message FullStatus {
   // on it to know when to re-fetch ListNetworks via the push stream, instead
   // of polling on every status snapshot.
   uint64 networksRevision = 11;
+  ScionState scionState = 12;
 }
 
 // Networks

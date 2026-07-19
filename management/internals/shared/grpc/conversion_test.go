@@ -14,8 +14,17 @@ import (
 	"github.com/netbirdio/netbird/management/internals/controllers/network_map"
 	"github.com/netbirdio/netbird/management/internals/controllers/network_map/controller/cache"
 	nbconfig "github.com/netbirdio/netbird/management/internals/server/config"
+	nbpeer "github.com/netbirdio/netbird/management/server/peer"
 	"github.com/netbirdio/netbird/management/server/types"
 )
+
+func TestAppendRemotePeerConfigMapsSCIONAddress(t *testing.T) {
+	const address = "1-ff00:0:110,[192.0.2.1]:30041"
+	peers := []*nbpeer.Peer{{Key: "key", IP: netip.MustParseAddr("100.64.0.1"), Meta: nbpeer.PeerSystemMeta{ScionAddress: address}}}
+	got := appendRemotePeerConfig(nil, peers, "example.test", false)
+	require.Len(t, got, 1)
+	require.Equal(t, address, got[0].GetScionAddress())
+}
 
 func TestToProtocolDNSConfigWithCache(t *testing.T) {
 	var cache cache.DNSConfigCache
